@@ -12,6 +12,7 @@ from fastapi.dependencies.utils import get_dependant, solve_dependencies
 from .async_exit_stack import async_exit_stack_manager
 from .cache import dependency_cache
 from .exception import FastAPICompatibilityError
+from .middleware import RequestContext, _current_request_context
 from .scope import _current_scope
 
 T = TypeVar("T")
@@ -71,6 +72,46 @@ def _verify_fastapi_compatibility(solve: Callable[..., Any]) -> None:
 
 
 _verify_fastapi_compatibility(solve_dependencies)
+
+
+def _build_fake_request_scope(
+    request_context: RequestContext | None,
+    *,
+    fastapi_inner_astack: AsyncExitStack,
+    fastapi_function_astack: AsyncExitStack,
+) -> tuple[dict[str, Any], FastAPI | None]:
+    """Build the ASGI scope for the fake request used during dependency resolution.
+
+    Returns the scope together with the app to resolve against: the real
+    request's app when a request is being handled, otherwise the globally
+    registered one (if any).
+    """
+    # These two inner stacks are used to workaround the assertion in fastapi==0.121.0
+    # Ref: https://github.com/fastapi/fastapi/commit/ac438b99342c859ae0e10f7064021125bd247bf5#diff-aef3dac481b68359f4edd6974fa3a047cfde595254a4567a560cebc9ccb0673fR575-R582 # noqa: E501
+    scope: dict[str, Any] = {
+        "type": "http",
+        "headers": [],
+        "query_string": "",
+        "fastapi_inner_astack": fastapi_inner_astack,
+        "fastapi_function_astack": fastapi_function_astack,
+    }
+    app = _get_app()
+    if request_context is not None:
+        # Resolve against the REAL request handled by InjectableRequestMiddleware:
+        # ``Request``/``request.app``/``request.state`` dependencies see actual
+        # request data, and on fastapi>=0.121 the request's own exit stacks (already
+        # present in its scope) win over the inner stacks above, so FastAPI itself
+        # runs generator cleanup when the request ends.
+        scope.update(request_context.scope)
+        # ``Request`` asserts an http scope; websocket sessions keep their real
+        # headers/app/etc. but are presented as http to the fake request.
+        scope["type"] = "http"
+        real_app = scope.get("app")
+        if real_app is not None:
+            app = real_app
+    elif app is not None:
+        scope["app"] = app
+    return scope, app
 
 
 async def register_app(app: FastAPI) -> None:
@@ -160,8 +201,11 @@ async def resolve_dependencies(
     root_dep.call = cast("Callable[..., Any]", func)
 
     scope = _current_scope.get()
+    request_context = _current_request_context.get() if scope is None else None
     if scope is not None:
         async_exit_stack = scope.exit_stack
+    elif request_context is not None:
+        async_exit_stack = request_context.exit_stack
     else:
         async_exit_stack = await async_exit_stack_manager.get_stack(root_dep.call)
 
@@ -179,21 +223,16 @@ async def resolve_dependencies(
     async_exit_stack.push_async_exit(fastapi_inner_astack)
     async_exit_stack.push_async_exit(fastapi_function_astack)
 
-    fake_request_scope: dict[str, Any] = {
-        "type": "http",
-        "headers": [],
-        "query_string": "",
-        # These two inner stacks are used to workaround the assertion in fastapi==0.121.0
-        # Ref: https://github.com/fastapi/fastapi/commit/ac438b99342c859ae0e10f7064021125bd247bf5#diff-aef3dac481b68359f4edd6974fa3a047cfde595254a4567a560cebc9ccb0673fR575-R582 # noqa: E501
-        "fastapi_inner_astack": fastapi_inner_astack,
-        "fastapi_function_astack": fastapi_function_astack,
-    }
-    app = _get_app()
-    if app is not None:
-        fake_request_scope["app"] = app
+    fake_request_scope, app = _build_fake_request_scope(
+        request_context,
+        fastapi_inner_astack=fastapi_inner_astack,
+        fastapi_function_astack=fastapi_function_astack,
+    )
     fake_request = Request(fake_request_scope)
     if scope is not None:
         cache = scope.get_cache() if use_cache else None
+    elif request_context is not None:
+        cache = request_context.get_cache() if use_cache else None
     else:
         cache = dependency_cache.get() if use_cache else None
     try:

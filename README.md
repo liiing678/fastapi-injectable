@@ -611,6 +611,26 @@ Each iteration prints `opened connection` / `closed connection`, proving resourc
 
 **Prefer a context manager?** In async workers, [`injectable_scope()`](#3-isolated-dependency-scopes-for-parallel-work) wraps this whole pattern — each `async with injectable_scope():` block gets its own exit stack and cache and cleans up on exit, so you can't forget the reset (and it's safe under `asyncio.TaskGroup` fan-out). To also clean up when the **process** exits (SIGTERM/SIGINT), call [`setup_graceful_shutdown()`](#graceful-shutdown). For full, copy-pasteable worker recipes — Celery, Dramatiq, Temporal, and a Typer CLI — see [Real-world Examples](https://fastapi-injectable.readthedocs.io/en/latest/real-world-examples.html).
 
+### Request-scoped lifecycle inside FastAPI apps
+
+If you call `@injectable` functions or `get_injected_obj()` **from within a FastAPI request** (e.g. reusing your service layer in an endpoint), the default process-global cache and exit stacks are out of sync with the request: instances live for the whole application, generator cleanup never runs at request end, and requests (or tests) pollute each other. Add `InjectableRequestMiddleware` to align the container's scope with FastAPI's request scope:
+
+```python
+from fastapi import FastAPI
+from fastapi_injectable import InjectableRequestMiddleware
+
+app = FastAPI()
+app.add_middleware(InjectableRequestMiddleware)
+```
+
+With the middleware installed, for every HTTP request (and websocket session):
+
+- **Per-request caching** — dependencies resolved through the container are cached only for the duration of the request, so the same provider yields **one instance per request**, and nothing leaks into the next request (or the next test).
+- **Cleanup at request end** — generator dependencies are torn down when the request finishes. If the request raises, the exception is forwarded to the generators' `yield` points (exactly as FastAPI unwinds a failing request), so `except`/`rollback` branches run.
+- **The real request** — resolution happens against the actual request, so dependencies that take `Request` (or read `request.app` / `request.state`) see real request data.
+
+An explicit `injectable_scope()` opened inside a handler still takes precedence over the request context, and apps without the middleware behave exactly as before. Note that FastAPI's own `Depends` resolution keeps its private per-request cache, so a provider used *both* natively in a route signature *and* through the container is instantiated once per side — stick to one injection style per provider if you need a single shared instance.
+
 ### Type Hinting
 
 `fastapi-injectable` will prepare the dependency objects of injected functions for you, but static type checkers like `mypy` haven't known about the dependency object existence since they are normally injected via `Annotated[Type, Depends(get_dependency_func)]`, when using this kind of expression, static type checkers will complain if you don't explicitly provide the dependency object when using the function, example error codes ([call-arg](https://mypy.readthedocs.io/en/stable/error_code_list.html#check-arguments-in-calls-call-arg)).

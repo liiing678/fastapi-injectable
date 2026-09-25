@@ -3,6 +3,7 @@ from .decorator import injectable
 from .exception import DependencyCleanupError, RunCoroutineSyncMaxRetriesError
 from .logging import configure_logging
 from .main import register_app, resolve_dependencies
+from .middleware import InjectableRequestMiddleware
 from .scope import InjectableScope, injectable_scope
 from .util import (
     async_get_injected_obj,
@@ -15,6 +16,7 @@ from .util import (
 
 __all__ = [
     "DependencyCleanupError",
+    "InjectableRequestMiddleware",
     "InjectableScope",
     "RunCoroutineSyncMaxRetriesError",
     "async_get_injected_obj",
