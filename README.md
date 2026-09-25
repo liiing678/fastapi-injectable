@@ -904,6 +904,54 @@ pytestmark = pytest.mark.usefixtures("injectable_cleanup")
 
 Both the autouse reset and the `injectable_cleanup` fixture work in sync and async tests alike, and honour whatever loop strategy you've configured via `loop_manager`.
 
+### Request-scoped Injection in FastAPI Apps
+
+Inside a FastAPI app, dependencies resolved through `fastapi-injectable` normally live in the **process-global** cache and exit-stack manager — an application-level lifetime. If you use the container next to FastAPI's native `Depends()`, a dependency you think of as request-scoped is effectively cached for the whole app, leaking across requests (and across tests that share the process).
+
+`InjectableScopeMiddleware` aligns the two lifecycles. It opens one `InjectableScope` per HTTP request (and per WebSocket connection) and closes it when the request ends:
+
+```python
+from fastapi import FastAPI
+from fastapi_injectable import InjectableScopeMiddleware
+
+app = FastAPI()
+app.add_middleware(InjectableScopeMiddleware)
+```
+
+With the middleware in place, for the duration of each request:
+
+- **Request-scoped cache** — every `fastapi-injectable` resolution (`@injectable`, `get_injected_obj()`, `async_get_injected_obj()`, and `Depends()` nested inside them) shares one private cache. The same provider yields **one instance per request** no matter which injection style asks for it, and nothing touches the process-global cache.
+- **Request-end cleanup** — generator dependencies run their cleanup exactly when the request finishes (after the response is sent). If the endpoint raised, the exception is forwarded into the generators at their `yield`, the same rollback semantics FastAPI gives native dependencies.
+- **Zero API changes** — `@injectable` and friends are used exactly as before, inside or outside a request.
+
+```python
+from typing import Annotated
+from fastapi import Depends
+from fastapi_injectable import async_get_injected_obj, injectable
+
+async def get_db() -> AsyncGenerator[DB, None]:
+    db = DB()
+    yield db
+    await db.close()  # runs when the request ends
+
+@injectable
+async def get_service(db: Annotated[DB, Depends(get_db)]) -> Service:
+    return Service(db)
+
+@app.get("/items")
+async def list_items() -> list[Item]:
+    service = await get_service()                 # decorator style
+    db = await async_get_injected_obj(get_db)     # container style
+    assert service.db is db                       # one instance per request
+    return await service.list_items()
+```
+
+Notes:
+
+- Dependencies declared directly in route signatures (`def endpoint(db = Depends(get_db))`) are resolved by FastAPI's own internal per-request cache, which FastAPI does not expose — the middleware aligns everything resolved *through fastapi-injectable*. To share one instance between a route and the container, resolve it through `fastapi-injectable` in both places.
+- The `lifespan` scope passes through untouched, so application-level dependencies keep their process-global lifetime.
+- The active scope is exposed on the ASGI scope as `request.scope["fastapi_injectable_scope"]` (`INJECTABLE_SCOPE_KEY`) for introspection.
+
 <!-- usage-end -->
 
 ## Advanced Scenarios
